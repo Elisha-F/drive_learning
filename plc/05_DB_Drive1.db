@@ -1,0 +1,44 @@
+DATA_BLOCK "DB_Drive1"
+TITLE = Drive 1 - commands, simulation settings, status and telegram images
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 0.1
+NON_RETAIN
+//Put this DB in a watch table and operate the drive from there.
+   VAR
+      SimMode : Bool := TRUE;   // TRUE = virtual drive, FALSE = real S210 on PROFINET
+      Cmd : Struct
+         Enable : Bool;   // TRUE = run, FALSE = OFF1
+         AckError : Bool;   // set TRUE then FALSE to acknowledge
+         Speed_rpm : Real;   // speed setpoint
+         RequestAbsPosition : Bool;   // G1_STW.13
+      END_STRUCT;
+      Cfg : Struct
+         RefSpeed_rpm : Real := 3000.0;   // p2000, must match the drive
+      END_STRUCT;
+      Sim : Struct
+         InjectFault : Bool;
+         InjectAlarm : Bool;
+         InjectEncoderFault : Bool;
+         RampUp_s : Real := 1.0;   // p1120
+         RampDown_s : Real := 1.0;   // p1121
+      END_STRUCT;
+      Status : Struct
+         Running : Bool;
+         Error : Bool;
+         Warning : Bool;
+         EncoderError : Bool;
+         SpeedAct_rpm : Real;
+         PositionAct : DInt;
+         SimState : Int;   // 1..4 = S1..S4, 51 = OFF1, 52 = OFF3, 99 = fault
+         SimFault : DInt;
+         SimAlarm : DInt;
+         SimPosition_rev : LReal;
+      END_STRUCT;
+      TlgOut : "UDT_Tlg3_Setpoint";   // what the PLC sends (watch STW1 here)
+      TlgIn : "UDT_Tlg3_Actual";   // what the drive answers (watch ZSW1 here)
+   END_VAR
+
+
+BEGIN
+
+END_DATA_BLOCK

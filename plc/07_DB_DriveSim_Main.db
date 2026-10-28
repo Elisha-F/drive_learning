@@ -1,0 +1,9 @@
+DATA_BLOCK "DB_DriveSim_Main"
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 0.1
+NON_RETAIN
+"FB_DriveSim_Main"
+
+BEGIN
+
+END_DATA_BLOCK

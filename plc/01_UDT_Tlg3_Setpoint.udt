@@ -1,0 +1,14 @@
+TYPE "UDT_Tlg3_Setpoint"
+TITLE = PROFIdrive standard telegram 3 - setpoint direction (PLC -> drive)
+VERSION : 0.1
+//5 words / 10 bytes. In a non-optimized layout the members sit at byte offsets 0, 2, 6, 8
+//which matches the telegram on the wire, so this type can also be used for a PLC tag
+//placed on the real S210 output addresses.
+   STRUCT
+      STW1 : Word;      // PZD1     control word 1
+      NSOLL_B : DInt;   // PZD2+3   speed setpoint, 16#4000_0000 = p2000 reference speed
+      STW2 : Word;      // PZD4     control word 2 (bits 12..15 = master sign-of-life)
+      G1_STW : Word;    // PZD5     encoder 1 control word
+   END_STRUCT;
+
+END_TYPE

@@ -1,0 +1,84 @@
+FUNCTION_BLOCK "FB_Tlg3_Control"
+TITLE = Simple PLC-side speed control of a drive via standard telegram 3
+{ S7_Optimized_Access := 'TRUE' }
+AUTHOR : drive_learning
+VERSION : 0.1
+//Example of the PLC side. It works the same against the virtual drive and a real S210.
+//Builds STW1 / NSOLL_B / STW2 / G1_STW and decodes ZSW1 / NIST_B / G1_XIST1.
+//
+//Switch-on sequence handled here:
+//  STW1 = 16#047E  (OFF1 active)    -> drive leaves "switching on inhibited" (S1 -> S2)
+//  STW1 = 16#047F  (ON)             -> drive switches on and enables operation (S3 -> S4)
+   VAR_INPUT
+      Enable : Bool;   // TRUE = run, FALSE = OFF1 (ramp down)
+      AckError : Bool;   // fault acknowledge (drive reacts to the rising edge)
+      Speed_rpm : Real;   // speed setpoint
+      RefSpeed_rpm : Real := 3000.0;   // must equal p2000 in the drive
+      RequestAbsPosition : Bool;   // G1_STW.13: ask for the absolute value in G1_XIST2
+      Actual : "UDT_Tlg3_Actual";   // telegram drive -> PLC
+   END_VAR
+
+   VAR_OUTPUT
+      Setpoint : "UDT_Tlg3_Setpoint";   // telegram PLC -> drive
+      Running : Bool;   // ZSW1.2 operation enabled
+      Error : Bool;   // ZSW1.3 fault present
+      Warning : Bool;   // ZSW1.7 alarm present
+      EncoderError : Bool;   // G1_ZSW.15
+      SpeedAct_rpm : Real;   // from NIST_B
+      PositionAct : DInt;   // G1_XIST1 in encoder increments
+   END_VAR
+
+   VAR
+      masterLs : Int;
+   END_VAR
+
+   VAR_TEMP
+      ratio : Real;
+   END_VAR
+
+   VAR CONSTANT
+      NORM_100 : Real := 1073741824.0;   // 16#4000_0000 = 100 % reference speed
+   END_VAR
+
+
+BEGIN
+	REGION STW1
+	    // bits 1,2 (no OFF2/OFF3), 3 (enable operation), 4,5,6 (RFG / setpoint enable), 10 (control by PLC)
+	    #Setpoint.STW1 := 16#047E;
+	    // ON only once the drive has left "switching on inhibited", otherwise it stays in S1
+	    #Setpoint.STW1.%X0 := #Enable AND NOT #Actual.ZSW1.%X6 AND NOT #Actual.ZSW1.%X3;
+	    #Setpoint.STW1.%X7 := #AckError;
+	END_REGION
+
+	REGION Speed setpoint
+	    IF #RefSpeed_rpm > 0.0 THEN
+	        #ratio := LIMIT(MN := -1.99, IN := #Speed_rpm / #RefSpeed_rpm, MX := 1.99);
+	    ELSE
+	        #ratio := 0.0;
+	    END_IF;
+	    #Setpoint.NSOLL_B := REAL_TO_DINT(#ratio * #NORM_100);
+	END_REGION
+
+	REGION STW2 / G1_STW
+	    // master sign-of-life 1..15 in STW2 bits 12..15 (only monitored in isochronous mode)
+	    #masterLs := #masterLs + 1;
+	    IF #masterLs > 15 THEN
+	        #masterLs := 1;
+	    END_IF;
+	    #Setpoint.STW2 := SHL(IN := INT_TO_WORD(#masterLs), N := 12);
+
+	    #Setpoint.G1_STW := 16#0000;
+	    #Setpoint.G1_STW.%X13 := #RequestAbsPosition;
+	    #Setpoint.G1_STW.%X15 := #AckError;   // also acknowledge encoder faults
+	END_REGION
+
+	REGION Status
+	    #Running := #Actual.ZSW1.%X2;
+	    #Error := #Actual.ZSW1.%X3;
+	    #Warning := #Actual.ZSW1.%X7;
+	    #EncoderError := #Actual.G1_ZSW.%X15;
+	    #SpeedAct_rpm := DINT_TO_REAL(#Actual.NIST_B) / #NORM_100 * #RefSpeed_rpm;
+	    #PositionAct := #Actual.G1_XIST1;
+	END_REGION
+
+END_FUNCTION_BLOCK

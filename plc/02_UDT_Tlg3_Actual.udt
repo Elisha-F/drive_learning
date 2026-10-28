@@ -1,0 +1,16 @@
+TYPE "UDT_Tlg3_Actual"
+TITLE = PROFIdrive standard telegram 3 - actual value direction (drive -> PLC)
+VERSION : 0.1
+//9 words / 18 bytes. Non-optimized byte offsets 0, 2, 6, 8, 10, 14 match the telegram
+//on the wire, so this type can also be used for a PLC tag placed on the real S210
+//input addresses.
+   STRUCT
+      ZSW1 : Word;       // PZD1     status word 1
+      NIST_B : DInt;     // PZD2+3   speed actual value, 16#4000_0000 = p2000 reference speed
+      ZSW2 : Word;       // PZD4     status word 2 (bits 12..15 = slave sign-of-life)
+      G1_ZSW : Word;     // PZD5     encoder 1 status word
+      G1_XIST1 : DInt;   // PZD6+7   encoder 1 position actual value 1 (cyclic, incremental)
+      G1_XIST2 : DInt;   // PZD8+9   encoder 1 position actual value 2 (absolute value on request / error code)
+   END_STRUCT;
+
+END_TYPE

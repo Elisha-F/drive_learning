@@ -1,0 +1,67 @@
+FUNCTION_BLOCK "FB_DriveSim_Main"
+TITLE = Wiring: controller <-> virtual S210 or real S210
+{ S7_Optimized_Access := 'TRUE' }
+AUTHOR : drive_learning
+VERSION : 0.1
+//Call once per cycle from a cyclic interrupt OB (e.g. OB30, 4 ms) or OB1.
+//SimMode = TRUE : the telegram goes to the virtual drive, RealOut is held at zero.
+//SimMode = FALSE: the telegram goes to RealOut / comes from RealIn, so wire those to
+//                 PLC tags on the S210 telegram 3 addresses.
+   VAR_INPUT
+      RealIn : "UDT_Tlg3_Actual";   // optional: PLC tag on the S210 input addresses
+   END_VAR
+
+   VAR_OUTPUT
+      RealOut : "UDT_Tlg3_Setpoint";   // optional: PLC tag on the S210 output addresses
+   END_VAR
+
+   VAR
+      Control : "FB_Tlg3_Control";
+      Drive : "FB_VirtualS210_Tlg3";
+   END_VAR
+
+
+BEGIN
+	REGION PLC side
+	    #Control(Enable := "DB_Drive1".Cmd.Enable,
+	             AckError := "DB_Drive1".Cmd.AckError,
+	             Speed_rpm := "DB_Drive1".Cmd.Speed_rpm,
+	             RefSpeed_rpm := "DB_Drive1".Cfg.RefSpeed_rpm,
+	             RequestAbsPosition := "DB_Drive1".Cmd.RequestAbsPosition,
+	             Actual := "DB_Drive1".TlgIn,
+	             Setpoint => "DB_Drive1".TlgOut,
+	             Running => "DB_Drive1".Status.Running,
+	             Error => "DB_Drive1".Status.Error,
+	             Warning => "DB_Drive1".Status.Warning,
+	             EncoderError => "DB_Drive1".Status.EncoderError,
+	             SpeedAct_rpm => "DB_Drive1".Status.SpeedAct_rpm,
+	             PositionAct => "DB_Drive1".Status.PositionAct);
+	END_REGION
+
+	REGION Drive side
+	    IF "DB_Drive1".SimMode THEN
+	        #Drive(Setpoint := "DB_Drive1".TlgOut,
+	               RefSpeed_rpm := "DB_Drive1".Cfg.RefSpeed_rpm,
+	               RampUp_s := "DB_Drive1".Sim.RampUp_s,
+	               RampDown_s := "DB_Drive1".Sim.RampDown_s,
+	               InjectFault := "DB_Drive1".Sim.InjectFault,
+	               InjectAlarm := "DB_Drive1".Sim.InjectAlarm,
+	               InjectEncoderFault := "DB_Drive1".Sim.InjectEncoderFault,
+	               Actual => "DB_Drive1".TlgIn,
+	               DriveState => "DB_Drive1".Status.SimState,
+	               ActiveFault => "DB_Drive1".Status.SimFault,
+	               ActiveAlarm => "DB_Drive1".Status.SimAlarm,
+	               Position_rev => "DB_Drive1".Status.SimPosition_rev);
+
+	        // never command a real drive while simulating (STW1 = 0 means OFF2)
+	        #RealOut.STW1 := 16#0000;
+	        #RealOut.NSOLL_B := 0;
+	        #RealOut.STW2 := 16#0000;
+	        #RealOut.G1_STW := 16#0000;
+	    ELSE
+	        #RealOut := "DB_Drive1".TlgOut;
+	        "DB_Drive1".TlgIn := #RealIn;
+	    END_IF;
+	END_REGION
+
+END_FUNCTION_BLOCK

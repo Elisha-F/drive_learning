@@ -1,0 +1,360 @@
+FUNCTION_BLOCK "FB_VirtualS210_Tlg3"
+TITLE = Virtual SINAMICS S210 - drive side of PROFIdrive standard telegram 3
+{ S7_Optimized_Access := 'TRUE' }
+AUTHOR : drive_learning
+VERSION : 0.1
+//Learning simulator, NOT a firmware emulation. Takes the telegram the PLC would send to the
+//drive and returns the telegram a drive would answer with:
+//  - PROFIdrive state machine (S1..S5, fault) driven by STW1, reported in ZSW1
+//  - ramp-function generator, speed loop (first-order lag) and coast-down
+//  - NIST_B speed feedback, G1_XIST1 / G1_XIST2 encoder position, G1_STW / G1_ZSW handshake
+//  - slave sign-of-life in ZSW2
+//  - fault / alarm / encoder-fault injection for practising error handling
+//Cycle time is measured with RUNTIME, so it can be called from OB1 or a cyclic interrupt OB.
+//
+//State numbers (DriveState output):
+//   1 = S1 switching on inhibited      2 = S2 ready for switching on
+//   3 = S3 switched on                 4 = S4 operation
+//  51 = S5 OFF1 ramp-down             52 = S5 OFF3 quick stop
+//  99 = fault
+   VAR_INPUT
+      Setpoint : "UDT_Tlg3_Setpoint";   // telegram PLC -> drive
+      RefSpeed_rpm : Real := 3000.0;   // p2000 reference speed (16#4000_0000 = 100 %)
+      MaxSpeed_rpm : Real := 3000.0;   // p1082 maximum speed, setpoint is limited to this
+      RampUp_s : Real := 1.0;   // p1120 ramp-up time 0 -> p1082
+      RampDown_s : Real := 1.0;   // p1121 ramp-down time p1082 -> 0 (OFF1)
+      Off3Ramp_s : Real := 0.2;   // p1135 OFF3 ramp-down time p1082 -> 0
+      SpeedLoopTau_s : Real := 0.01;   // closed speed loop modelled as first-order lag
+      CoastTau_s : Real := 2.0;   // coast-down time constant when pulses are off
+      SpeedTolerance_rpm : Real := 50.0;   // ZSW1.8 window for setpoint/actual deviation
+      CompareSpeed_rpm : Real := 1500.0;   // p2141 threshold for ZSW1.10
+      IncrementsPerRev : DInt := 1048576;   // G1_XIST1 increments per motor revolution
+      InjectFault : Bool;   // TRUE = trip the drive (needs FALSE + STW1.7 edge to clear)
+      FaultCode : DInt := 7900;   // fault number reported while tripped (F07900 motor blocked)
+      InjectAlarm : Bool;   // TRUE = alarm present (ZSW1.7), drive keeps running
+      AlarmCode : DInt := 7910;   // alarm number (A07910 motor overtemperature)
+      InjectEncoderFault : Bool;   // TRUE = encoder fault (G1_ZSW.15, needs G1_STW.15 edge to clear)
+   END_VAR
+
+   VAR_OUTPUT
+      Actual : "UDT_Tlg3_Actual";   // telegram drive -> PLC
+      DriveState : Int;   // see state numbers above
+      SpeedAct_rpm : Real;   // simulated motor speed
+      Position_rev : LReal;   // simulated motor position in revolutions (not wrapped)
+      ActiveFault : DInt;   // 0 = no fault
+      ActiveAlarm : DInt;   // 0 = no alarm
+   END_VAR
+
+   VAR
+      state : Int := 1;
+      stw1 : Word;   // last STW1 accepted (only taken over while STW1.10 = 1)
+      nSet_B : DInt;   // last NSOLL_B accepted
+      ackOld : Bool;
+      g1AckOld : Bool;
+      encFault : Bool;
+      rfgOut_rpm : Real;
+      nAct_rpm : Real;
+      posCounts : LInt;   // absolute position in encoder increments
+      posFrac : LReal;   // sub-increment remainder carried to the next cycle
+      slaveLs : Int;
+      rtMem : LReal;
+   END_VAR
+
+   VAR_TEMP
+      dtL : LReal;
+      dt : Real;
+      ackEdge : Bool;
+      g1AckEdge : Bool;
+      standstill : Bool;
+      pulsesOn : Bool;
+      rfgActive : Bool;
+      nSet_rpm : Real;
+      target : Real;
+      rate : Real;
+      tau : Real;
+      goal : Real;
+      alpha : Real;
+      ratio : Real;
+      incr : DInt;
+      deltaCounts : LReal;
+      deltaInt : LInt;
+      wrapped : LInt;
+      xist : DInt;
+   END_VAR
+
+   VAR CONSTANT
+      NORM_100 : Real := 1073741824.0;   // 16#4000_0000 = 100 % reference speed
+      STANDSTILL_RPM : Real := 5.0;   // standstill detection after OFF1 / OFF3 (cf. p1226)
+   END_VAR
+
+
+BEGIN
+	REGION Cycle time
+	    #dtL := RUNTIME(#rtMem);
+	    IF #dtL < 0.0 THEN
+	        #dtL := 0.0;
+	    ELSIF #dtL > 0.1 THEN   // first call or long pause: don't let the model jump
+	        #dtL := 0.1;
+	    END_IF;
+	    #dt := LREAL_TO_REAL(#dtL);
+	END_REGION
+
+	REGION Receive telegram (PLC -> drive)
+	    // STW1.10 "control by PLC": the drive only takes over STW1 and the setpoint while it is 1
+	    IF #Setpoint.STW1.%X10 THEN
+	        #stw1 := #Setpoint.STW1;
+	        #nSet_B := #Setpoint.NSOLL_B;
+	    END_IF;
+
+	    // STW1.7 acknowledges faults on the rising edge only
+	    #ackEdge := #stw1.%X7 AND NOT #ackOld;
+	    #ackOld := #stw1.%X7;
+	END_REGION
+
+	REGION Faults
+	    IF #InjectFault AND #state <> 99 THEN
+	        #state := 99;
+	        #ActiveFault := #FaultCode;
+	    END_IF;
+
+	    IF #state = 99 AND #ackEdge AND NOT #InjectFault THEN
+	        #state := 1;   // after acknowledge the drive is in "switching on inhibited"
+	        #ActiveFault := 0;
+	    END_IF;
+
+	    #ActiveAlarm := SEL(G := #InjectAlarm, IN0 := 0, IN1 := #AlarmCode);
+	END_REGION
+
+	REGION State machine (PROFIdrive sequencer)
+	    #standstill := ABS(#rfgOut_rpm) < 0.001 AND ABS(#nAct_rpm) < #STANDSTILL_RPM;
+
+	    // STW1.0 = ON/OFF1, STW1.1 = no OFF2, STW1.2 = no OFF3, STW1.3 = enable operation
+	    CASE #state OF
+	        1:  // S1 switching on inhibited: needs OFF1 = 0 with OFF2 and OFF3 inactive
+	            IF NOT #stw1.%X0 AND #stw1.%X1 AND #stw1.%X2 THEN
+	                #state := 2;
+	            END_IF;
+
+	        2:  // S2 ready for switching on
+	            IF NOT #stw1.%X1 OR NOT #stw1.%X2 THEN
+	                #state := 1;
+	            ELSIF #stw1.%X0 THEN
+	                #state := 3;
+	            END_IF;
+
+	        3:  // S3 switched on
+	            IF NOT #stw1.%X1 OR NOT #stw1.%X2 THEN
+	                #state := 1;
+	            ELSIF NOT #stw1.%X0 THEN
+	                #state := 2;
+	            ELSIF #stw1.%X3 THEN
+	                #state := 4;
+	            END_IF;
+
+	        4:  // S4 operation
+	            IF NOT #stw1.%X1 THEN
+	                #state := 1;   // OFF2: pulses off immediately, motor coasts
+	            ELSIF NOT #stw1.%X2 THEN
+	                #state := 52;   // OFF3: quick stop
+	            ELSIF NOT #stw1.%X0 THEN
+	                #state := 51;   // OFF1: ramp down
+	            ELSIF NOT #stw1.%X3 THEN
+	                #state := 3;   // operation disabled: pulses off, motor coasts
+	            END_IF;
+
+	        51: // S5 OFF1 ramp-down
+	            IF NOT #stw1.%X1 THEN
+	                #state := 1;
+	            ELSIF NOT #stw1.%X2 THEN
+	                #state := 52;
+	            ELSIF NOT #stw1.%X3 THEN
+	                #state := 3;
+	            ELSIF #standstill THEN
+	                #state := 2;
+	            END_IF;
+
+	        52: // S5 OFF3 quick stop
+	            IF NOT #stw1.%X1 OR #standstill THEN
+	                #state := 1;
+	            END_IF;
+
+	        ELSE  // 99 fault: left only via acknowledge (region Faults)
+	            ;
+	    END_CASE;
+
+	    #pulsesOn := #state = 4 OR #state = 51 OR #state = 52;
+	END_REGION
+
+	REGION Ramp-function generator
+	    IF #RefSpeed_rpm > 0.0 THEN
+	        #nSet_rpm := DINT_TO_REAL(#nSet_B) / #NORM_100 * #RefSpeed_rpm;
+	    ELSE
+	        #nSet_rpm := 0.0;
+	    END_IF;
+	    #nSet_rpm := LIMIT(MN := -#MaxSpeed_rpm, IN := #nSet_rpm, MX := #MaxSpeed_rpm);
+
+	    #rfgActive := TRUE;
+	    #target := 0.0;
+	    #rate := 0.0;
+
+	    CASE #state OF
+	        4:
+	            IF NOT #stw1.%X4 THEN
+	                // STW1.4 = 0: RFG output set to zero, motor brakes as fast as possible
+	                #rfgOut_rpm := 0.0;
+	                #rfgActive := FALSE;
+	            ELSIF NOT #stw1.%X5 THEN
+	                // STW1.5 = 0: RFG frozen at its current value
+	                #rfgActive := FALSE;
+	            ELSE
+	                // STW1.6 = 0: setpoint input forced to zero, RFG ramps down
+	                #target := SEL(G := #stw1.%X6, IN0 := 0.0, IN1 := #nSet_rpm);
+	                IF ABS(#target) > ABS(#rfgOut_rpm) AND #target * #rfgOut_rpm >= 0.0 THEN
+	                    #rate := #RampUp_s;   // accelerating away from zero
+	                ELSE
+	                    #rate := #RampDown_s;
+	                END_IF;
+	            END_IF;
+	        51:
+	            #rate := #RampDown_s;
+	        52:
+	            #rate := #Off3Ramp_s;
+	        ELSE
+	            // pulses off: RFG output is zero
+	            #rfgOut_rpm := 0.0;
+	            #rfgActive := FALSE;
+	    END_CASE;
+
+	    IF #rfgActive THEN
+	        // #rate holds a ramp time here; convert to rpm per cycle
+	        IF #rate > 0.0 THEN
+	            #rate := #MaxSpeed_rpm / #rate * #dt;
+	        ELSE
+	            #rate := 1.0E9;   // ramp time 0 = setpoint passes straight through
+	        END_IF;
+
+	        IF #target > #rfgOut_rpm THEN
+	            #rfgOut_rpm := MIN(IN1 := #rfgOut_rpm + #rate, IN2 := #target);
+	        ELSE
+	            #rfgOut_rpm := MAX(IN1 := #rfgOut_rpm - #rate, IN2 := #target);
+	        END_IF;
+	    END_IF;
+	END_REGION
+
+	REGION Motor model
+	    IF #pulsesOn THEN
+	        #goal := #rfgOut_rpm;
+	        #tau := #SpeedLoopTau_s;
+	    ELSE
+	        #goal := 0.0;
+	        #tau := #CoastTau_s;
+	    END_IF;
+
+	    IF #tau > 0.0 THEN
+	        #alpha := MIN(IN1 := #dt / #tau, IN2 := 1.0);
+	    ELSE
+	        #alpha := 1.0;
+	    END_IF;
+	    #nAct_rpm := #nAct_rpm + (#goal - #nAct_rpm) * #alpha;
+	    IF NOT #pulsesOn AND ABS(#nAct_rpm) < 0.01 THEN
+	        #nAct_rpm := 0.0;
+	    END_IF;
+
+	    // integrate position in encoder increments, keep the fraction for the next cycle
+	    #incr := MAX(IN1 := #IncrementsPerRev, IN2 := 1);
+	    #deltaCounts := REAL_TO_LREAL(#nAct_rpm) / 60.0 * #dtL * DINT_TO_LREAL(#incr) + #posFrac;
+	    #deltaInt := LREAL_TO_LINT(#deltaCounts);
+	    #posFrac := #deltaCounts - LINT_TO_LREAL(#deltaInt);
+	    #posCounts := #posCounts + #deltaInt;
+
+	    // wrap to 32 bit like a real encoder counter
+	    #wrapped := #posCounts MOD LINT#4294967296;
+	    IF #wrapped >= LINT#2147483648 THEN
+	        #wrapped := #wrapped - LINT#4294967296;
+	    ELSIF #wrapped < LINT#-2147483648 THEN
+	        #wrapped := #wrapped + LINT#4294967296;
+	    END_IF;
+	    #xist := LINT_TO_DINT(#wrapped);
+	END_REGION
+
+	REGION Encoder interface (G1_STW / G1_ZSW)
+	    // G1_STW.15 acknowledges encoder faults on the rising edge
+	    #g1AckEdge := #Setpoint.G1_STW.%X15 AND NOT #g1AckOld;
+	    #g1AckOld := #Setpoint.G1_STW.%X15;
+
+	    IF #InjectEncoderFault THEN
+	        #encFault := TRUE;
+	    ELSIF #encFault AND #g1AckEdge THEN
+	        #encFault := FALSE;
+	    END_IF;
+
+	    #Actual.G1_ZSW := 16#0000;
+	    #Actual.G1_ZSW.%X11 := #Setpoint.G1_STW.%X15;   // acknowledging encoder fault active
+	    #Actual.G1_ZSW.%X13 := #Setpoint.G1_STW.%X13 AND NOT #encFault;   // absolute value sent cyclically
+	    #Actual.G1_ZSW.%X14 := #Setpoint.G1_STW.%X14;   // parking encoder active
+	    #Actual.G1_ZSW.%X15 := #encFault;   // encoder fault
+
+	    IF #encFault OR #Setpoint.G1_STW.%X14 THEN
+	        #Actual.G1_XIST1 := 0;
+	    ELSE
+	        #Actual.G1_XIST1 := #xist;
+	    END_IF;
+
+	    IF #encFault THEN
+	        #Actual.G1_XIST2 := 1;   // error code (simplified: 1 = encoder fault)
+	    ELSIF #Actual.G1_ZSW.%X13 THEN
+	        #Actual.G1_XIST2 := #xist;   // simplified: same scaling as XIST1
+	    ELSE
+	        #Actual.G1_XIST2 := 0;
+	    END_IF;
+	END_REGION
+
+	REGION Send telegram (drive -> PLC)
+	    #Actual.ZSW1 := 16#0000;
+	    CASE #state OF
+	        1:
+	            #Actual.ZSW1.%X6 := TRUE;   // switching on inhibited
+	        2:
+	            #Actual.ZSW1.%X0 := TRUE;   // ready for switching on
+	        3:
+	            #Actual.ZSW1.%X0 := TRUE;
+	            #Actual.ZSW1.%X1 := TRUE;   // ready for operation
+	        4, 51, 52:
+	            #Actual.ZSW1.%X0 := TRUE;
+	            #Actual.ZSW1.%X1 := TRUE;
+	            #Actual.ZSW1.%X2 := TRUE;   // operation enabled
+	        ELSE
+	            #Actual.ZSW1.%X3 := TRUE;   // fault present
+	    END_CASE;
+	    #Actual.ZSW1.%X4 := #stw1.%X1;   // no coast-down (OFF2) active
+	    #Actual.ZSW1.%X5 := #stw1.%X2;   // no quick stop (OFF3) active
+	    #Actual.ZSW1.%X7 := #InjectAlarm;   // alarm present
+	    #Actual.ZSW1.%X8 := ABS(#rfgOut_rpm - #nAct_rpm) <= #SpeedTolerance_rpm;   // deviation within tolerance
+	    #Actual.ZSW1.%X9 := TRUE;   // control requested
+	    #Actual.ZSW1.%X10 := ABS(#nAct_rpm) >= #CompareSpeed_rpm;   // comparison speed reached
+	    #Actual.ZSW1.%X11 := TRUE;   // I/M/P limit not reached (no torque model)
+	    #Actual.ZSW1.%X12 := #pulsesOn;   // holding brake open
+	    #Actual.ZSW1.%X13 := NOT #InjectAlarm;   // no motor overtemperature alarm
+	    #Actual.ZSW1.%X14 := #nAct_rpm >= 0.0;   // motor rotates forwards
+	    #Actual.ZSW1.%X15 := TRUE;   // no thermal overload alarm power unit
+
+	    IF #RefSpeed_rpm > 0.0 THEN
+	        #ratio := LIMIT(MN := -1.99, IN := #nAct_rpm / #RefSpeed_rpm, MX := 1.99);
+	    ELSE
+	        #ratio := 0.0;
+	    END_IF;
+	    #Actual.NIST_B := REAL_TO_DINT(#ratio * #NORM_100);
+
+	    // slave sign-of-life: counts 1..15 in ZSW2 bits 12..15
+	    #slaveLs := #slaveLs + 1;
+	    IF #slaveLs > 15 THEN
+	        #slaveLs := 1;
+	    END_IF;
+	    #Actual.ZSW2 := SHL(IN := INT_TO_WORD(#slaveLs), N := 12);
+
+	    #DriveState := #state;
+	    #SpeedAct_rpm := #nAct_rpm;
+	    #Position_rev := LINT_TO_LREAL(#posCounts) / DINT_TO_LREAL(#incr);
+	END_REGION
+
+END_FUNCTION_BLOCK
